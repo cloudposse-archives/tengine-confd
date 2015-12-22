@@ -1,0 +1,258 @@
+# WebSocket Proxy with Load Balancing
+
+# /nginx/<server>/config/worker_processes                               2
+# /nginx/<server>/config/worker_connections                             1024
+# /nginx/<server>/config/<name>/upstream/server/%n                      "web1.ourdomain.local:8080"
+# /nginx/<server>/config/<name>/upstream/keepalive                      30
+# /nginx/<server>/config/<name>/upstream/health_check                   interval=3 fails=5 passes=2 uri=/ 
+
+# /nginx/<server>/config/<name>/server/server_name                      "www.oursite.com"
+# /nginx/<server>/config/<name>/server/web_sockets                      "true"
+
+{{$config_path := printf "%s/config" (getenv "NGINX_PATH") }}
+
+# Total amount of users you can serve = worker_processes * worker_connections
+
+user www-data;
+
+pid /var/run/nginx.pid;
+
+error_log /dev/stderr;
+
+worker_processes    {{getv (printf "%s/worker_processes" $config_path)}};
+
+events {
+  worker_connections  {{getv (printf "%s/worker_connections" $config_path)}};
+}
+
+# Each connection needs a filehandle 
+worker_rlimit_nofile    20000; 
+
+http {
+
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
+
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  keepalive_timeout 65;
+  types_hash_max_size 2048;
+  server_tokens off;
+  #gzip  on;
+
+  server_names_hash_bucket_size  64;
+  # server_name_in_redirect off;
+
+
+  log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+  access_log /dev/stdout main;
+
+
+  # When using parametrised backends, a resolver must be configured in Nginx (it is unable to use the local OS resolver) and must point directly to a name server IP address.
+  resolver {{getenv "DOCKER_DNS"}} valid=5s;
+  resolver_timeout 5s;
+
+
+  map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+  }
+
+  {{range lsdir (printf "%s" $config_path)}}
+  {{$upstream_key := printf "%s/%s/path" $config_path .}}
+  # Traversing {{.}} for {{$upstream_key}}
+  {{  if (exists $upstream_key)}}
+  #
+  # Configuration for '{{.}}'
+  #
+  {{    $upstream_path := getv $upstream_key}}
+  upstream {{.}} {
+    # Clients with the same IP are redirected to the same backend
+    ip_hash;
+
+    # Sends an incoming request to the least-busy backend server, rather than distributing requests round-robin
+    #fair;
+
+    {{if exists (printf "%s/%s/upstream/keepalive" $config_path .)}}
+    keepalive {{getv (printf "%s/%s/upstream/keepalive" $config_path .)}};
+    {{else}}
+    # keepalives disabled
+    {{end}}{{/*end if*/}}
+
+    check_keepalive_requests 100;
+
+
+    {{if exists (printf "%s/%s/upstream/check" $config_path .)}}
+    check {{getv (printf "%s/%s/upstream/check" $config_path .)}};
+    {{else}}
+    # default check
+    check interval=5000 rise=2 fall=5 timeout=1000 type=http;
+    {{end}}{{/*end if*/}}
+
+    {{if exists (printf "%s/%s/upstream/check_http_send" $config_path .)}}
+    check_http_send "{{getv (printf "%s/%s/upstream/check_http_send" $config_path .)}}";
+    {{else}}
+    # default check_http_send
+    check_http_send "HEAD / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n"; 
+    {{end}}{{/*end if*/}}
+
+    {{if exists (printf "%s/%s/upstream/check_http_expect_alive" $config_path .)}}
+    check_http_expect_alive {{getv (printf "%s/%s/upstream/check_http_expect_alive" $config_path .)}};
+    {{else}}
+    # default check_http_expect_alive
+    check_http_expect_alive http_2xx http_3xx;
+    {{end}}{{/*end if*/}}
+
+
+    # Available backend servers
+    {{range ls (printf "%s" $upstream_path)}}
+    {{  if exists (printf "%s/%s" $upstream_path .) }}
+    server {{ getv (printf "%s/%s" $upstream_path .)}} max_fails=0;
+    {{  end}}
+    {{end}}{{/* end range */}}
+
+    {{range lsdir $upstream_path}}{{$subpath := printf "%s/%s" $upstream_path .}}
+    {{  range ls $subpath }}
+    # {{ printf "%s/%s" $subpath . }}
+    {{  if exists (printf "%s/%s" $subpath .) }}
+    server {{getv (printf "%s/%s" $subpath .) }} max_fails=0;
+    {{  else}}
+    #  ^^^^ must be a directory
+    {{    end}}{{/* end range */}}
+    {{  end}}{{/* end if ls */}}
+    {{end}}{{/* end range */}}
+
+
+    # This just acts as a place holder to ensure we don't have an empty upstream definition
+    server 127.0.0.1:80 down;
+  }
+
+  server {
+    #listen 80 spdy_detect;
+    listen 80;
+
+    server_name {{getv (printf "%s/%s/server/server_name" $config_path .)}};
+    tcp_nodelay on;
+
+    location / {
+      # switch off logging
+      access_log off;
+
+      # Announce SPDY support
+      #add_header Alternate-Protocol  80:npn-spdy/2;
+
+      # redirect all HTTP traffic to {{.}}
+      {{if exists (printf "%s/%s/server/proxy_pass" $config_path .)}}
+      # force dns resolution of {{.}} after initialization
+      set $server "{{getv (printf "%s/%s/server/proxy_pass" $config_path .)}}";
+      proxy_pass http://$server;
+      {{else if exists (printf "%s/%s/path" $config_path .)}}
+      proxy_pass http://{{.}};
+      {{else}}
+      # no valid upstreams for {{.}}
+      {{end}}
+
+      # HTTP/1.1
+      proxy_http_version 1.1;
+
+      # Set headers
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+    
+      {{if exists (printf "%s/%s/server/location/web_sockets" $config_path .)}}
+      # WebSocket support
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      {{else}}
+      # WebSocket support disabled
+      {{end}}{{/* end if /config/%s/server/location/web_sockets */}}
+
+      # When buffering is disabled, the response is passed to a client synchronously, immediately as it is received. 
+      proxy_buffering off;
+
+      proxy_next_upstream error timeout;
+
+      # Path rewriting
+      #rewrite /services/myservice/(.*) /$1 break;
+      proxy_redirect off;
+    }
+  }
+  {{end}}{{/* end if lsdir /config/%s/upstream/server/ */}}
+  # End of configuration for {{.}}
+  {{end}}{{/* end range lsdir "/config/" */}}
+
+  #
+  # Default server configuration
+  #
+  server {
+    #listen       80 spdy_detect default_server;
+    listen       80 default_server;
+    server_name  _;
+
+    #charset koi8-r;
+    #access_log  /var/log/nginx/log/host.access.log  main;
+
+    location = /favicon.ico { access_log off; log_not_found off; }  
+    location = /robots.txt { access_log off; log_not_found off; }
+
+    location /nginx/status {
+      check_status;
+      access_log off;
+      #allow 10.0.0.0/8;
+      #allow 127.0.0.1/32;
+      #allow 192.168.0.0/16; 
+      #deny all;
+    }
+
+    location / {
+        root   /etc/nginx/html;
+        index  index.html index.htm;
+    }
+
+    error_page  404              /404.html;
+    location = /404.html {
+        root   /etc/nginx/html;
+    }
+
+    error_page  401 403          /40x.html;
+    location = /40x.html {
+        root   /etc/nginx/html;
+    }
+
+    # redirect server error pages to the static page /50x.html
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /etc/nginx/html;
+    }
+
+    # proxy the PHP scripts to Apache listening on 127.0.0.1:80
+    #location ~ \.php$ {
+    #    proxy_pass   http://127.0.0.1;
+    #}
+
+    # pass the PHP scripts to FastCGI server listening on 127.0.0.1:9000
+
+    #location ~ \.php$ {
+    #    root           html;
+    #    fastcgi_pass   127.0.0.1:9000;
+    #    fastcgi_index  index.php;
+    #    fastcgi_param  SCRIPT_FILENAME  /scripts$fastcgi_script_name;
+    #    include        fastcgi_params;
+    #}
+
+    # deny access to .htaccess files, if Apache's document root
+    # concurs with nginx's one
+
+    #location ~ /\.ht {
+    #    deny  all;
+    #}
+  }
+
+}
+

@@ -1,0 +1,7 @@
+[template]
+prefix = "/"
+src = "default.html.tmpl"
+dest = "/etc/nginx/html/default.html"
+owner = "nginx"
+mode = "0644"
+keys = [ ]
